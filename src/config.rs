@@ -69,7 +69,7 @@ lazy_static::lazy_static! {
     static ref ONLINE: Mutex<HashMap<String, i64>> = Default::default();
     pub static ref PROD_RENDEZVOUS_SERVER: RwLock<String> = RwLock::new("".to_owned());
     pub static ref EXE_RENDEZVOUS_SERVER: RwLock<String> = Default::default();
-    pub static ref APP_NAME: RwLock<String> = RwLock::new("BetterDesk Client".to_owned());
+    pub static ref APP_NAME: RwLock<String> = RwLock::new("NeoDesk Client".to_owned());
     static ref KEY_PAIR: Mutex<Option<KeyPair>> = Default::default();
     static ref USER_DEFAULT_CONFIG: RwLock<(UserDefaultConfig, Instant)> = RwLock::new((UserDefaultConfig::load(), Instant::now()));
     pub static ref NEW_STORED_PEER_CONFIG: Mutex<HashSet<String>> = Default::default();
@@ -97,23 +97,23 @@ lazy_static::lazy_static! {
     pub static ref APP_HOME_DIR: RwLock<String> = Default::default();
 }
 
-pub const LINK_DOCS_HOME: &str = "https://github.com/trybetterdesk/betterdesk";
-pub const LINK_DOCS_X11_REQUIRED: &str = "https://github.com/trybetterdesk/betterdesk";
+pub const LINK_DOCS_HOME: &str = "https://github.com/neodeskapp/neodesk";
+pub const LINK_DOCS_X11_REQUIRED: &str = "https://github.com/neodeskapp/neodesk";
 
-/// Official desktop client product id reported to BetterDesk API (sysinfo / login).
-pub const BETTERDESK_CLIENT_PRODUCT: &str = "betterdesk-desktop";
-/// On-disk / process executable stem (Windows: betterdesk.exe). Display name is `APP_NAME`.
-pub const EXE_NAME: &str = "betterdesk";
+/// Official desktop client product id reported to NeoDesk API (sysinfo / login).
+pub const NEODESK_CLIENT_PRODUCT: &str = "neodesk-desktop";
+/// On-disk / process executable stem (Windows: neodesk.exe). Display name is `APP_NAME`.
+pub const EXE_NAME: &str = "neodesk";
 /// URI scheme without spaces (APP_NAME may contain spaces).
-pub const URI_SCHEME: &str = "betterdesk";
+pub const URI_SCHEME: &str = "neodesk";
 /// Previous client scheme. Still accepted so existing `rustdesk://` links keep working.
 pub const LEGACY_URI_SCHEME: &str = "rustdesk";
 
 /// Upstream project this client is forked from (AGPL-3.0 attribution).
 pub const UPSTREAM_PROJECT_NAME: &str = "RustDesk";
 pub const UPSTREAM_REPO_URL: &str = "https://github.com/rustdesk/rustdesk";
-/// Source code for this BetterDesk client build (AGPL corresponding source).
-pub const FORK_REPO_URL: &str = "https://github.com/trybetterdesk/betterdesk-client";
+/// Source code for this NeoDesk client build (AGPL corresponding source).
+pub const FORK_REPO_URL: &str = "https://github.com/neodeskapp/neodesk-client";
 pub const LICENSE_SPDX: &str = "AGPL-3.0-only";
 pub const LICENSE_NAME: &str = "GNU Affero General Public License v3.0";
 
@@ -131,7 +131,7 @@ const CHARS: &[char] = &[
     'm', 'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
 ];
 
-/// Empty: BetterDesk never falls back to public rustdesk.com rendezvous.
+/// Empty: NeoDesk never falls back to public rustdesk.com rendezvous.
 pub const RENDEZVOUS_SERVERS: &[&str] = &[];
 /// Unused as a default peer/rendezvous key; kept only for legacy decode helpers.
 /// Configure `key` via Network settings, deploy string, or `custom.txt`.
@@ -2159,22 +2159,22 @@ pub struct LocalConfig {
     size: Size,
     #[serde(default, deserialize_with = "deserialize_vec_string")]
     pub fav: Vec<String>,
-    // BetterDesk incoming-only connection policy. Scalars must come before the
+    // NeoDesk incoming-only connection policy. Scalars must come before the
     // maps below: `confy` serialises through `toml` 0.5, which emits maps as
     // tables and rejects any primitive value that follows one. With a scalar
     // after a table every save failed with
     //   "Failed to serialize configuration data into TOML"
     // and the `_local` config silently stopped persisting (issue #497).
     #[serde(default, deserialize_with = "deserialize_string")]
-    betterdesk_connection_mode: String,
+    neodesk_connection_mode: String,
     #[serde(default)]
-    betterdesk_connection_mode_revision: u64,
+    neodesk_connection_mode_revision: u64,
     #[serde(default, deserialize_with = "deserialize_string")]
-    betterdesk_connection_mode_command_id: String,
+    neodesk_connection_mode_command_id: String,
     #[serde(default, deserialize_with = "deserialize_string")]
-    betterdesk_connection_mode_status: String,
+    neodesk_connection_mode_status: String,
     #[serde(default, deserialize_with = "deserialize_string")]
-    betterdesk_connection_mode_error: String,
+    neodesk_connection_mode_error: String,
     // Maps last (see the note above): emitted as TOML tables.
     #[serde(default, deserialize_with = "deserialize_hashmap_string_string")]
     options: HashMap<String, String>,
@@ -2321,7 +2321,7 @@ impl LocalConfig {
         LOCAL_CONFIG
             .read()
             .unwrap()
-            .betterdesk_connection_mode
+            .neodesk_connection_mode
             .clone()
     }
 
@@ -2329,14 +2329,14 @@ impl LocalConfig {
         LOCAL_CONFIG
             .read()
             .unwrap()
-            .betterdesk_connection_mode_revision
+            .neodesk_connection_mode_revision
     }
 
     pub fn get_connection_mode_command_id() -> String {
         LOCAL_CONFIG
             .read()
             .unwrap()
-            .betterdesk_connection_mode_command_id
+            .neodesk_connection_mode_command_id
             .clone()
     }
 
@@ -2344,7 +2344,7 @@ impl LocalConfig {
         LOCAL_CONFIG
             .read()
             .unwrap()
-            .betterdesk_connection_mode_status
+            .neodesk_connection_mode_status
             .clone()
     }
 
@@ -2352,7 +2352,7 @@ impl LocalConfig {
         LOCAL_CONFIG
             .read()
             .unwrap()
-            .betterdesk_connection_mode_error
+            .neodesk_connection_mode_error
             .clone()
     }
 
@@ -2364,11 +2364,11 @@ impl LocalConfig {
         error: &str,
     ) {
         let mut config = LOCAL_CONFIG.write().unwrap();
-        config.betterdesk_connection_mode = mode.to_owned();
-        config.betterdesk_connection_mode_revision = revision;
-        config.betterdesk_connection_mode_command_id = command_id.to_owned();
-        config.betterdesk_connection_mode_status = status.to_owned();
-        config.betterdesk_connection_mode_error = error.to_owned();
+        config.neodesk_connection_mode = mode.to_owned();
+        config.neodesk_connection_mode_revision = revision;
+        config.neodesk_connection_mode_command_id = command_id.to_owned();
+        config.neodesk_connection_mode_status = status.to_owned();
+        config.neodesk_connection_mode_error = error.to_owned();
         config.store();
     }
 }
@@ -3525,16 +3525,28 @@ mod tests {
     }
 
     #[test]
-    fn test_links_point_at_the_trybetterdesk_repositories() {
-        assert_eq!(FORK_REPO_URL, "https://github.com/trybetterdesk/betterdesk-client");
+    fn test_links_point_at_the_neodeskapp_repositories() {
+        assert_eq!(FORK_REPO_URL, "https://github.com/neodeskapp/neodesk-client");
         for (name, url) in HELPER_URL.iter() {
             assert!(
-                url.starts_with("https://github.com/trybetterdesk/betterdesk"),
+                url.starts_with("https://github.com/neodeskapp/neodesk"),
                 "{name} points at {url}"
             );
         }
         // The upstream link is AGPL attribution and stays.
         assert_eq!(UPSTREAM_REPO_URL, "https://github.com/rustdesk/rustdesk");
+    }
+
+    #[test]
+    fn test_app_identity_is_neodesk() {
+        assert_eq!(APP_NAME.read().unwrap().as_str(), "NeoDesk Client");
+        assert_eq!(EXE_NAME, "neodesk");
+        assert_eq!(URI_SCHEME, "neodesk");
+        assert_eq!(NEODESK_CLIENT_PRODUCT, "neodesk-desktop");
+        assert_eq!(crate::VER_TYPE_RUSTDESK_CLIENT, "neodesk-client");
+        // The config directory is named after the app.
+        let path = Config::path("").to_string_lossy().to_lowercase();
+        assert!(path.contains("neodesk"), "{path}");
     }
 
     #[test]
@@ -3574,11 +3586,11 @@ mod tests {
         cfg.kb_layout_type = "map".to_owned();
         cfg.size = (100, 200, 800, 600);
         cfg.fav = vec!["111222333".to_owned(), "444555666".to_owned()];
-        cfg.betterdesk_connection_mode = "incoming-only".to_owned();
-        cfg.betterdesk_connection_mode_revision = 7;
-        cfg.betterdesk_connection_mode_command_id = "cmd-42".to_owned();
-        cfg.betterdesk_connection_mode_status = "applied".to_owned();
-        cfg.betterdesk_connection_mode_error = String::new();
+        cfg.neodesk_connection_mode = "incoming-only".to_owned();
+        cfg.neodesk_connection_mode_revision = 7;
+        cfg.neodesk_connection_mode_command_id = "cmd-42".to_owned();
+        cfg.neodesk_connection_mode_status = "applied".to_owned();
+        cfg.neodesk_connection_mode_error = String::new();
         cfg.options.insert("enable-audio".to_owned(), "Y".to_owned());
         cfg.options
             .insert("custom-rendezvous-server".to_owned(), "panel.example".to_owned());
@@ -3592,7 +3604,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).expect("config file must exist");
         let first_table = text.find("\n[").unwrap_or(text.len());
         let mode_pos = text
-            .find("betterdesk_connection_mode")
+            .find("neodesk_connection_mode")
             .expect("connection mode must be written");
         assert!(
             mode_pos < first_table,
@@ -3605,20 +3617,20 @@ mod tests {
         assert_eq!(parsed.fav, cfg.fav);
         assert_eq!(parsed.size, cfg.size);
         assert_eq!(
-            parsed.betterdesk_connection_mode,
-            cfg.betterdesk_connection_mode
+            parsed.neodesk_connection_mode,
+            cfg.neodesk_connection_mode
         );
         assert_eq!(
-            parsed.betterdesk_connection_mode_revision,
-            cfg.betterdesk_connection_mode_revision
+            parsed.neodesk_connection_mode_revision,
+            cfg.neodesk_connection_mode_revision
         );
         assert_eq!(
-            parsed.betterdesk_connection_mode_command_id,
-            cfg.betterdesk_connection_mode_command_id
+            parsed.neodesk_connection_mode_command_id,
+            cfg.neodesk_connection_mode_command_id
         );
         assert_eq!(
-            parsed.betterdesk_connection_mode_status,
-            cfg.betterdesk_connection_mode_status
+            parsed.neodesk_connection_mode_status,
+            cfg.neodesk_connection_mode_status
         );
         assert_eq!(parsed.options, cfg.options);
         assert_eq!(parsed.ui_flutter, cfg.ui_flutter);
@@ -3635,7 +3647,7 @@ mod tests {
         let text = toml::to_string_pretty(&cfg).expect("default LocalConfig must serialise");
         let parsed: LocalConfig = toml::from_str(&text).expect("default LocalConfig must parse");
         assert_eq!(parsed.remote_id, "");
-        assert_eq!(parsed.betterdesk_connection_mode, "");
+        assert_eq!(parsed.neodesk_connection_mode, "");
         assert!(parsed.options.is_empty());
         assert!(parsed.ui_flutter.is_empty());
     }

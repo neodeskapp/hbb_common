@@ -490,11 +490,11 @@ pub struct VersionCheckResponse {
     pub url: String,
 }
 
-pub const VER_TYPE_RUSTDESK_CLIENT: &str = "betterdesk-client";
-pub const VER_TYPE_RUSTDESK_SERVER: &str = "betterdesk-server";
+pub const VER_TYPE_RUSTDESK_CLIENT: &str = "neodesk-client";
+pub const VER_TYPE_RUSTDESK_SERVER: &str = "neodesk-server";
 
 pub fn version_check_request(typ: String) -> (VersionCheckRequest, String) {
-    // Official BetterDesk builds do not query rustdesk.com. Prefer `/api/software` on your API.
+    // Official NeoDesk builds do not query rustdesk.com. Prefer `/api/software` on your API.
     const URL: &str = "";
 
     use sysinfo::System;
