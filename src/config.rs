@@ -97,8 +97,8 @@ lazy_static::lazy_static! {
     pub static ref APP_HOME_DIR: RwLock<String> = Default::default();
 }
 
-pub const LINK_DOCS_HOME: &str = "https://github.com/UNITRONIX/BetterDesk";
-pub const LINK_DOCS_X11_REQUIRED: &str = "https://github.com/UNITRONIX/BetterDesk";
+pub const LINK_DOCS_HOME: &str = "https://github.com/trybetterdesk/betterdesk";
+pub const LINK_DOCS_X11_REQUIRED: &str = "https://github.com/trybetterdesk/betterdesk";
 
 /// Official desktop client product id reported to BetterDesk API (sysinfo / login).
 pub const BETTERDESK_CLIENT_PRODUCT: &str = "betterdesk-desktop";
@@ -113,7 +113,7 @@ pub const LEGACY_URI_SCHEME: &str = "rustdesk";
 pub const UPSTREAM_PROJECT_NAME: &str = "RustDesk";
 pub const UPSTREAM_REPO_URL: &str = "https://github.com/rustdesk/rustdesk";
 /// Source code for this BetterDesk client build (AGPL corresponding source).
-pub const FORK_REPO_URL: &str = "https://github.com/UNITRONIX/BetterDesk-Client";
+pub const FORK_REPO_URL: &str = "https://github.com/trybetterdesk/betterdesk-client";
 pub const LICENSE_SPDX: &str = "AGPL-3.0-only";
 pub const LICENSE_NAME: &str = "GNU Affero General Public License v3.0";
 
@@ -3522,6 +3522,19 @@ mod tests {
             assert!(is_permanent_incoming_only());
             assert!(is_incoming_only());
         });
+    }
+
+    #[test]
+    fn test_links_point_at_the_trybetterdesk_repositories() {
+        assert_eq!(FORK_REPO_URL, "https://github.com/trybetterdesk/betterdesk-client");
+        for (name, url) in HELPER_URL.iter() {
+            assert!(
+                url.starts_with("https://github.com/trybetterdesk/betterdesk"),
+                "{name} points at {url}"
+            );
+        }
+        // The upstream link is AGPL attribution and stays.
+        assert_eq!(UPSTREAM_REPO_URL, "https://github.com/rustdesk/rustdesk");
     }
 
     #[test]
