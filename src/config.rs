@@ -54,7 +54,7 @@ const SERIAL: i32 = 3;
 
 #[cfg(target_os = "macos")]
 lazy_static::lazy_static! {
-    pub static ref ORG: RwLock<String> = RwLock::new("com.unitronix".to_owned());
+    pub static ref ORG: RwLock<String> = RwLock::new("sk.neode".to_owned());
 }
 
 type Size = (i32, i32, i32, i32);
@@ -3540,6 +3540,8 @@ mod tests {
     #[test]
     fn test_app_identity_is_neodesk() {
         assert_eq!(APP_NAME.read().unwrap().as_str(), "NeoDesk Client");
+        #[cfg(target_os = "macos")]
+        assert_eq!(ORG.read().unwrap().as_str(), "sk.neode");
         assert_eq!(EXE_NAME, "neodesk");
         assert_eq!(URI_SCHEME, "neodesk");
         assert_eq!(NEODESK_CLIENT_PRODUCT, "neodesk-desktop");
