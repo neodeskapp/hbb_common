@@ -773,6 +773,12 @@ impl Config {
     fn store(&self) {
         let mut config = self.clone();
         Self::prepare_config_for_store(&mut config);
+        if config.key_pair.0.is_empty() {
+            // Another process of this client (a join run as `--join`) can
+            // have written the device's key pair after this process loaded
+            // its config. A config without a key pair must not write it away.
+            config.key_pair = Config::load_::<Config>("").key_pair;
+        }
         if !config.password.is_empty()
             && decode_permanent_password_h1_from_storage(&config.password).is_none()
         {
@@ -1199,6 +1205,10 @@ impl Config {
             std::thread::spawn(|| {
                 let mut config = CONFIG.write().unwrap();
                 config.key_pair = key_pair;
+                // No server has confirmed this key yet: register it instead
+                // of sending heartbeats for the key the server holds.
+                config.key_confirmed = false;
+                config.keys_confirmed = Default::default();
                 config.store();
             });
         }
@@ -3956,6 +3966,73 @@ mod tests {
 
         let stored = Config::load_::<Config2>("2");
         assert_eq!(stored.unlock_pin, original_unlock_pin);
+    }
+
+    /// Takes the cached key pair for a test and puts it back afterwards.
+    struct KeyPairCacheGuard(Option<KeyPair>);
+
+    impl KeyPairCacheGuard {
+        fn new() -> Self {
+            Self(KEY_PAIR.lock().unwrap().take())
+        }
+    }
+
+    impl Drop for KeyPairCacheGuard {
+        fn drop(&mut self) {
+            *KEY_PAIR.lock().unwrap() = self.0.take();
+        }
+    }
+
+    // A join run as `--join` writes the device's key pair from its own
+    // process while the service's server process runs with a config it
+    // loaded before. When the server process then confirms the key and
+    // stores its config, the key pair must stay in the file (L438).
+    #[test]
+    fn test_store_keeps_a_key_pair_another_process_wrote() {
+        let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap();
+        let _file_guard = ConfigFileRestoreGuard::new(Config::file());
+        let _state_guard = ConfigStateTestGuard::new(Config::default(), HashMap::new());
+        let mut joined = Config::default();
+        joined.key_pair = (vec![7u8; 64], vec![9u8; 32]);
+        Config::store_(&joined, "");
+
+        Config::set_key_confirmed(true);
+
+        let stored = Config::load_::<Config>("");
+        assert_eq!(stored.key_pair, joined.key_pair);
+        assert!(stored.key_confirmed);
+    }
+
+    // A key pair made now is not the key any server confirmed, so the
+    // client registers it instead of only sending heartbeats (L438).
+    #[test]
+    fn test_a_new_key_pair_is_stored_unconfirmed() {
+        use std::time::{Duration, Instant};
+        let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap();
+        let _file_guard = ConfigFileRestoreGuard::new(Config::file());
+        let _key_guard = KeyPairCacheGuard::new();
+        let mut confirmed = Config::default();
+        confirmed.key_confirmed = true;
+        confirmed
+            .keys_confirmed
+            .insert("10.0.0.1:21116".to_owned(), true);
+        Config::store_(&confirmed, "");
+        let _state_guard = ConfigStateTestGuard::new(confirmed, HashMap::new());
+
+        let (_, pk) = Config::get_key_pair();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let stored = Config::load_::<Config>("");
+            if stored.key_pair.1 == pk {
+                assert!(!stored.key_confirmed);
+                assert!(stored.keys_confirmed.is_empty());
+                break;
+            }
+            assert!(Instant::now() < deadline, "the new key pair was not stored");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!Config::get_key_confirmed());
     }
 
     #[test]
