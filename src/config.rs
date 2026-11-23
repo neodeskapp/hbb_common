@@ -613,6 +613,30 @@ pub fn store_path<T: serde::Serialize>(path: PathBuf, cfg: T) -> crate::ResultTy
     }
 }
 
+/// The ID stock RustDesk derives from a MAC address.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn stock_id_from_mac(mac: &[u8; 6]) -> u32 {
+    let mut id = 0u32;
+    for x in &mac[2..] {
+        id = (id << 8) | (*x as u32);
+    }
+    id & 0x1FFFFFFF
+}
+
+/// NeoDesk's ID for a MAC address. It stays bound to the computer, so a
+/// reinstall keeps it, and flips bits of stock RustDesk's, so a stock
+/// RustDesk on the same computer never has the same ID and both can run.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn neodesk_id_from_mac(mac: &[u8; 6]) -> u32 {
+    const NEODESK_ID_BITS: u32 = 0x0E0D_E5C0;
+    stock_id_from_mac(mac) ^ NEODESK_ID_BITS
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn moved_stock_id_for_mac(id: &str, mac: &[u8; 6]) -> Option<String> {
+    (id == stock_id_from_mac(mac).to_string()).then(|| neodesk_id_from_mac(mac).to_string())
+}
+
 impl Config {
     fn load_<T: serde::Serialize + serde::de::DeserializeOwned + Default + std::fmt::Debug>(
         suffix: &str,
@@ -669,6 +693,14 @@ impl Config {
                     log::error!("Failed to generate new id");
                 }
             }
+        } else if let Some(id) = Config::moved_stock_id(&config.id) {
+            log::info!(
+                "ID {} is stock RustDesk's on this computer, NeoDesk takes {}",
+                config.id,
+                id
+            );
+            config.id = id;
+            store = true;
         }
         if store {
             config.store();
@@ -1082,18 +1114,29 @@ impl Config {
 
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
-            let mut id = 0u32;
             if let Ok(Some(ma)) = mac_address::get_mac_address() {
-                for x in &ma.bytes()[2..] {
-                    id = (id << 8) | (*x as u32);
-                }
-                id &= 0x1FFFFFFF;
+                let id = neodesk_id_from_mac(&ma.bytes());
                 log::info!("Generated id {}", id);
                 Some(id.to_string())
             } else {
                 None
             }
         }
+    }
+
+    /// NeoDesk's ID for a stored `id` that is the one stock RustDesk derives
+    /// on this computer, which 1.5.0-rc.4 and older took as their own.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn moved_stock_id(id: &str) -> Option<String> {
+        let Ok(Some(ma)) = mac_address::get_mac_address() else {
+            return None;
+        };
+        moved_stock_id_for_mac(id, &ma.bytes())
+    }
+
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    fn moved_stock_id(_id: &str) -> Option<String> {
+        None
     }
 
     pub fn get_auto_password(length: usize) -> String {
@@ -3535,6 +3578,37 @@ mod tests {
         }
         // The upstream link is AGPL attribution and stays.
         assert_eq!(UPSTREAM_REPO_URL, "https://github.com/rustdesk/rustdesk");
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[test]
+    fn test_id_differs_from_stock_rustdesk_on_one_computer() {
+        let macs: [[u8; 6]; 5] = [
+            [0x52, 0x54, 0x00, 0x12, 0x34, 0x56],
+            [0xbc, 0x24, 0x11, 0x41, 0x4a, 0x8e],
+            [0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+            [0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            [0x02, 0x42, 0xac, 0x11, 0x00, 0x02],
+        ];
+        for mac in &macs {
+            let stock = stock_id_from_mac(mac);
+            let ours = neodesk_id_from_mac(mac);
+            assert_ne!(ours, stock, "{mac:02x?}");
+            // Bound to the computer: the same address gives the same ID.
+            assert_eq!(ours, neodesk_id_from_mac(mac));
+            assert!(ours <= 0x1FFFFFFF);
+            // An install that stored stock RustDesk's ID moves to its own;
+            // any other ID stays.
+            assert_eq!(
+                moved_stock_id_for_mac(&stock.to_string(), mac),
+                Some(ours.to_string())
+            );
+            assert_eq!(moved_stock_id_for_mac(&ours.to_string(), mac), None);
+            assert_eq!(moved_stock_id_for_mac("123456789x", mac), None);
+        }
+        // Stock RustDesk's own derivation stays as it is.
+        assert_eq!(stock_id_from_mac(&macs[0]), 0x0012_3456);
+        assert_eq!(stock_id_from_mac(&macs[3]), 0x1FFF_FFFF);
     }
 
     #[test]
