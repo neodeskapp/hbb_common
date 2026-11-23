@@ -226,14 +226,43 @@ pub fn get_version_from_url(url: &str) -> String {
     "".to_owned()
 }
 
+/// The version a build reports: `release` (NEODESK_RELEASE_VERSION, set by
+/// the release workflow) when it is `cargo_version` with a pre-release
+/// suffix, such as 1.5.0-rc.4 for 1.5.0, else `cargo_version`.
+pub fn release_version(cargo_version: &str, release: Option<&str>) -> String {
+    let Some(release) = release.map(str::trim) else {
+        return cargo_version.to_owned();
+    };
+    let suffix_ok = release
+        .strip_prefix(cargo_version)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .map_or(false, |suffix| {
+            !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_alphanumeric() || c == '.')
+        });
+    if suffix_ok {
+        release.to_owned()
+    } else {
+        cargo_version.to_owned()
+    }
+}
+
 pub fn gen_version() {
     println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-env-changed=NEODESK_RELEASE_VERSION");
     use std::io::prelude::*;
     let mut file = File::create("./src/version.rs").unwrap();
+    let release = std::env::var("NEODESK_RELEASE_VERSION").ok();
     for line in read_lines("Cargo.toml").unwrap().flatten() {
         let ab: Vec<&str> = line.split('=').map(|x| x.trim()).collect();
         if ab.len() == 2 && ab[0] == "version" {
-            file.write_all(format!("pub const VERSION: &str = {};\n", ab[1]).as_bytes())
+            let cargo_version = ab[1].trim_matches('"');
+            let version = release_version(cargo_version, release.as_deref());
+            if release.as_deref().map_or(false, |r| !r.trim().is_empty() && r.trim() != version) {
+                println!(
+                    "cargo:warning=NEODESK_RELEASE_VERSION {release:?} is not a release of {cargo_version}; the build reports {version}"
+                );
+            }
+            file.write_all(format!("pub const VERSION: &str = \"{version}\";\n").as_bytes())
                 .ok();
             break;
         }
@@ -631,5 +660,29 @@ mod test {
         assert_eq!(get_version_number("1.1.10-1"), 1001101);
         assert_eq!(get_version_number("1.1.11-1"), 1001111);
         assert_eq!(get_version_number("1.2.3"), 1002030);
+    }
+
+    #[test]
+    fn test_release_version_carries_the_pre_release_suffix() {
+        for (release, reported) in [
+            (Some("1.5.0-rc.4"), "1.5.0-rc.4"),
+            (Some("1.5.0-dev.42"), "1.5.0-dev.42"),
+            (Some(" 1.5.0-beta.2\n"), "1.5.0-beta.2"),
+            (Some("1.5.0"), "1.5.0"),
+            (None, "1.5.0"),
+            (Some(""), "1.5.0"),
+            // Not a release of this version, or not a plain suffix.
+            (Some("1.6.0-rc.1"), "1.5.0"),
+            (Some("1.5.0-"), "1.5.0"),
+            (Some("1.5.0-rc.4\"; evil"), "1.5.0"),
+            (Some("1.5.01"), "1.5.0"),
+        ] {
+            assert_eq!(release_version("1.5.0", release), reported, "{release:?}");
+        }
+        // The suffix doesn't change what the version means to a peer.
+        assert_eq!(
+            get_version_number(&release_version("1.5.0", Some("1.5.0-rc.4"))),
+            get_version_number("1.5.0")
+        );
     }
 }
