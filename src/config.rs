@@ -94,6 +94,17 @@ static SECRETS_HOLDER: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// holds the device's secrets (L442).
 pub const SECRET_OPTIONS: &[&str] = &[keys::OPTION_2FA];
 
+/// What an install's `--import-config` did, see [`Config::import_profile`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileImport {
+    /// The profile's config has no ID or no key pair: nothing to take.
+    Empty,
+    /// The service holds a key pair already: it keeps its whole config.
+    KeptServiceConfig,
+    /// The profile's config and config2 went in where they were newer.
+    Imported { config: bool, config2: bool },
+}
+
 /// The device's secrets that a process which does not hold them found in its
 /// own config files, the copies an older version left in the person's
 /// profile, for the process that holds them (L442).
@@ -910,6 +921,33 @@ impl Config {
 
     pub fn file() -> PathBuf {
         Self::file_("")
+    }
+
+    /// `--import-config`: an install, run as the service, takes the config
+    /// of the profile at `path` (and its config2 next to it), the one a
+    /// portable run used. A service that holds a key pair already (an update,
+    /// or an install over the folder an uninstall kept) keeps its whole
+    /// config: its ID, key pair, permanent password, 2FA secret and settings
+    /// stay, and the server keeps knowing the device (L488). Only a service
+    /// without a key pair takes the profile's, where the profile's file is
+    /// newer than the service's and older than this program.
+    pub fn import_profile(path: &Path) -> ProfileImport {
+        let path2 = PathBuf::from(path.to_string_lossy().replace(".toml", "2.toml"));
+        let config: Config = load_path(path.to_path_buf());
+        if config.is_empty() {
+            return ProfileImport::Empty;
+        }
+        if !Config::load_::<Config>("").key_pair.0.is_empty() {
+            return ProfileImport::KeptServiceConfig;
+        }
+        let modified = crate::get_modified_time(path);
+        let config = modified > crate::get_modified_time(&Config::file())
+            && modified < crate::get_exe_time()
+            && store_path(Config::file(), config).is_ok();
+        let config2: Config2 = load_path(path2.clone());
+        let config2 = crate::get_modified_time(&path2) > crate::get_modified_time(&Config2::file())
+            && store_path(Config2::file(), config2).is_ok();
+        ProfileImport::Imported { config, config2 }
     }
 
     fn file_(suffix: &str) -> PathBuf {
@@ -4758,6 +4796,148 @@ mod tests {
         sent.key_pair = first.clone();
         Config::set_from_user_server(sent);
         assert!(stored_key_pair() == first);
+    }
+
+    /// A profile's config files from a portable run, with times that an
+    /// install takes them by: newer than the service's, older than this
+    /// program.
+    struct PortableProfile {
+        dir: PathBuf,
+        file: PathBuf,
+    }
+
+    impl PortableProfile {
+        fn new(name: &str, config: &Config, config2: &Config2) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "neodesk-import-{name}-{}",
+                std::process::id()
+            ));
+            fs::remove_dir_all(&dir).ok();
+            fs::create_dir_all(&dir).unwrap();
+            let file = dir.join("NeoDesk Client.toml");
+            let file2 = dir.join("NeoDesk Client2.toml");
+            store_path(file.clone(), config).unwrap();
+            store_path(file2.clone(), config2).unwrap();
+            let before_this_program = crate::get_exe_time() - Duration::from_secs(60);
+            for path in [&file, &file2] {
+                set_modified(path, before_this_program);
+            }
+            for path in [Config::file(), Config2::file()] {
+                if path.exists() {
+                    set_modified(&path, SystemTime::UNIX_EPOCH + Duration::from_secs(86_400));
+                }
+            }
+            Self { dir, file }
+        }
+    }
+
+    impl Drop for PortableProfile {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.dir).ok();
+        }
+    }
+
+    fn set_modified(path: &Path, time: SystemTime) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+    }
+
+    fn portable_run() -> (Config, Config2) {
+        let mut config = Config::default();
+        config.id = "111111111".to_owned();
+        config.key_pair = test_key_pair();
+        let mut config2 = Config2::default();
+        config2.options.insert(
+            "custom-rendezvous-server".to_owned(),
+            "portable.example.org".to_owned(),
+        );
+        (config, config2)
+    }
+
+    // An install after a portable run never replaces the key the service's
+    // folder holds (an update, or an install over the folder an uninstall
+    // kept): the service keeps its whole config (L488).
+    #[test]
+    fn test_an_install_keeps_the_config_of_a_service_that_holds_a_key() {
+        let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap();
+        let _file_guard = ConfigFileRestoreGuard::new(Config::file());
+        let _file2_guard = ConfigFileRestoreGuard::new(Config2::file());
+        let mut service = Config::default();
+        service.id = "222222222".to_owned();
+        service.key_pair = test_key_pair();
+        service.key_confirmed = true;
+        Config::store_(&service, "");
+        let mut service2 = Config2::default();
+        service2.options.insert(
+            "custom-rendezvous-server".to_owned(),
+            "service.example.org".to_owned(),
+        );
+        Config::store_(&service2, "2");
+        let (portable, portable2) = portable_run();
+        let profile = PortableProfile::new("kept", &portable, &portable2);
+
+        assert_eq!(
+            Config::import_profile(&profile.file),
+            ProfileImport::KeptServiceConfig
+        );
+        let after = Config::load_::<Config>("");
+        assert!(
+            after.key_pair == service.key_pair,
+            "the install replaced the service's key"
+        );
+        assert_eq!(after.id, "222222222", "the install replaced the service's ID");
+        assert!(after.key_confirmed);
+        assert_eq!(
+            Config::load_::<Config2>("2")
+                .options
+                .get("custom-rendezvous-server")
+                .map(String::as_str),
+            Some("service.example.org"),
+            "the install replaced the service's settings"
+        );
+    }
+
+    // A first install takes the portable run's ID, key and settings, so the
+    // device the server knows stays the same (adopt if none).
+    #[test]
+    fn test_a_first_install_takes_the_portable_run_s_config() {
+        let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap();
+        let _file_guard = ConfigFileRestoreGuard::new(Config::file());
+        let _file2_guard = ConfigFileRestoreGuard::new(Config2::file());
+        let mut service = Config::default();
+        service.id = "222222222".to_owned();
+        Config::store_(&service, "");
+        Config::store_(&Config2::default(), "2");
+        let (portable, portable2) = portable_run();
+        let profile = PortableProfile::new("first", &portable, &portable2);
+
+        assert_eq!(
+            Config::import_profile(&profile.file),
+            ProfileImport::Imported {
+                config: true,
+                config2: true
+            }
+        );
+        let after = Config::load_::<Config>("");
+        assert!(after.key_pair == portable.key_pair);
+        assert_eq!(after.id, "111111111");
+        assert_eq!(
+            Config::load_::<Config2>("2")
+                .options
+                .get("custom-rendezvous-server")
+                .map(String::as_str),
+            Some("portable.example.org")
+        );
+
+        // A profile without a key pair has nothing to take
+        let mut keyless = portable.clone();
+        keyless.key_pair = Default::default();
+        let keyless = PortableProfile::new("keyless", &keyless, &portable2);
+        assert_eq!(Config::import_profile(&keyless.file), ProfileImport::Empty);
     }
 
     #[test]
