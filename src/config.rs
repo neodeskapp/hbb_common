@@ -642,11 +642,7 @@ impl Config {
         suffix: &str,
     ) -> T {
         let file = Self::file_(suffix);
-        let cfg = load_path(file);
-        if suffix.is_empty() {
-            log::trace!("{:?}", cfg);
-        }
-        cfg
+        load_path(file)
     }
 
     fn store_<T: serde::Serialize>(config: &T, suffix: &str) {
