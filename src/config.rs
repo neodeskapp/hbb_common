@@ -83,6 +83,76 @@ lazy_static::lazy_static! {
     pub static ref BUILTIN_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
 }
 
+/// Whether this process holds the device's secrets, see
+/// [`Config::set_holds_secrets`].
+static SECRETS_HOLDER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Options that hold a secret of the device: the 2FA secret. Like the key
+/// pair and the stored permanent password, they stay in the process that
+/// holds the device's secrets (L442).
+pub const SECRET_OPTIONS: &[&str] = &[keys::OPTION_2FA];
+
+/// The device's secrets that a process which does not hold them found in its
+/// own config files, the copies an older version left in the person's
+/// profile, for the process that holds them (L442).
+#[derive(Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProfileSecrets {
+    /// The key pair (secret key, public key).
+    pub key_pair: Option<(Vec<u8>, Vec<u8>)>,
+    /// The stored permanent password and its salt.
+    pub permanent_password: Option<(String, String)>,
+    /// Secret options by name, see [`SECRET_OPTIONS`].
+    pub options: HashMap<String, String>,
+}
+
+impl std::fmt::Debug for ProfileSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Names only: no secret goes into a log line
+        f.debug_struct("ProfileSecrets")
+            .field("key_pair", &self.key_pair.is_some())
+            .field("permanent_password", &self.permanent_password.is_some())
+            .field("options", &self.options.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl ProfileSecrets {
+    fn is_empty(&self) -> bool {
+        self.key_pair.is_none() && self.permanent_password.is_none() && self.options.is_empty()
+    }
+}
+
+/// Takes the secret options out of `options`.
+fn remove_secret_options(options: &mut HashMap<String, String>) {
+    for key in SECRET_OPTIONS {
+        options.remove(*key);
+    }
+}
+
+/// Puts the secret options of `from` into `options` in place of any that
+/// `options` has.
+fn keep_secret_options(options: &mut HashMap<String, String>, from: &HashMap<String, String>) {
+    remove_secret_options(options);
+    for key in SECRET_OPTIONS {
+        if let Some(value) = from.get(*key) {
+            options.insert((*key).to_owned(), value.clone());
+        }
+    }
+}
+
+/// Whether `key_pair` is an Ed25519 secret key and the public key it
+/// belongs to.
+fn is_ed25519_key_pair((secret_key, public_key): &KeyPair) -> bool {
+    let (Some(secret_key), Some(public_key)) = (
+        sign::SecretKey::from_slice(secret_key),
+        sign::PublicKey::from_slice(public_key),
+    ) else {
+        return false;
+    };
+    const PROBE: &[u8] = b"NeoDesk key pair check";
+    sign::verify_detached(&sign::sign_detached(PROBE, &secret_key), PROBE, &public_key)
+}
+
 #[cfg(target_os = "android")]
 lazy_static::lazy_static! {
     pub static ref ANDROID_RUSTLS_PLATFORM_VERIFIER_INITIALIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -527,6 +597,10 @@ impl Config2 {
             decrypt_str_or_original(&config.unlock_pin, PASSWORD_ENC_VERSION);
         config.unlock_pin = unlock_pin;
         store |= store2;
+        if !Config::holds_secrets() {
+            // A copy an older version stored stays in the file only (L442)
+            remove_secret_options(&mut config.options);
+        }
         if store {
             config.store();
         }
@@ -552,6 +626,10 @@ impl Config2 {
         }
         config.unlock_pin =
             keep_encrypted_storage_if_plaintext_unchanged(&config.unlock_pin, &stored.unlock_pin);
+        if !Config::holds_secrets() {
+            // The file's secret options stay as they are (L442)
+            keep_secret_options(&mut config.options, &stored.options);
+        }
         Config::store_(&config, "2");
     }
 
@@ -559,7 +637,10 @@ impl Config2 {
         return CONFIG2.read().unwrap().clone();
     }
 
-    pub fn set(cfg: Config2) -> bool {
+    pub fn set(mut cfg: Config2) -> bool {
+        if !Config::holds_secrets() {
+            remove_secret_options(&mut cfg.options);
+        }
         let mut lock = CONFIG2.write().unwrap();
         if *lock == cfg {
             return false;
@@ -567,6 +648,22 @@ impl Config2 {
         *lock = cfg;
         lock.store();
         true
+    }
+
+    /// This process's config2 for another process of the client, without the
+    /// secret options: they never leave the process that holds them over
+    /// IPC (L442).
+    pub fn get_for_other_process() -> Config2 {
+        let mut config = Self::get();
+        remove_secret_options(&mut config.options);
+        config
+    }
+
+    /// Takes a config2 another process of the client sent and keeps this
+    /// process's secret options, whatever the config2 sent carries (L442).
+    pub fn set_from_other_process(mut cfg: Config2) -> bool {
+        keep_secret_options(&mut cfg.options, &CONFIG2.read().unwrap().options);
+        Self::set(cfg)
     }
 }
 
@@ -654,6 +751,11 @@ impl Config {
 
     fn load() -> Config {
         let mut config = Config::load_::<Config>("");
+        if !Self::holds_secrets() {
+            // Copies an older version stored stay in the file only (L442)
+            config.key_pair = Default::default();
+            config.password.clear();
+        }
         let mut store = false;
         if let Err(err) = Self::validate_or_decrypt_permanent_password_storage(&mut config) {
             log::error!("Failed to validate or decrypt permanent password storage: {err}");
@@ -768,19 +870,31 @@ impl Config {
 
     fn store(&self) {
         let mut config = self.clone();
-        Self::prepare_config_for_store(&mut config);
-        if config.key_pair.0.is_empty() {
-            // Another process of this client (a join run as `--join`) can
-            // have written the device's key pair after this process loaded
-            // its config. A config without a key pair must not write it away.
-            config.key_pair = Config::load_::<Config>("").key_pair;
-        }
-        if !config.password.is_empty()
-            && decode_permanent_password_h1_from_storage(&config.password).is_none()
-        {
+        if Self::holds_secrets() {
+            Self::prepare_config_for_store(&mut config);
+            if config.key_pair.0.is_empty() {
+                // Another process of this client (a join run as `--join`) can
+                // have written the device's key pair after this process loaded
+                // its config. A config without a key pair must not write it away.
+                config.key_pair = Config::load_::<Config>("").key_pair;
+            }
+            if !config.password.is_empty()
+                && decode_permanent_password_h1_from_storage(&config.password).is_none()
+            {
+                let stored = Config::load_::<Config>("");
+                config.password = keep_encrypted_storage_if_plaintext_unchanged(
+                    &config.password,
+                    &stored.password,
+                );
+            }
+        } else {
+            // This process never writes a secret: the key pair and the
+            // stored permanent password in the file stay as they are, with
+            // the password's salt (L442)
             let stored = Config::load_::<Config>("");
-            config.password =
-                keep_encrypted_storage_if_plaintext_unchanged(&config.password, &stored.password);
+            config.key_pair = stored.key_pair;
+            config.password = stored.password;
+            config.salt = stored.salt;
         }
         let (stored_id, encrypted, _) =
             decrypt_str_or_original(&config.enc_id, PASSWORD_ENC_VERSION);
@@ -1192,6 +1306,10 @@ impl Config {
         if let Some(p) = lock.as_ref() {
             return p.clone();
         }
+        if !Self::holds_secrets() {
+            // Another process holds the device's key (L442)
+            return Default::default();
+        }
         let mut config = Config::load_::<Config>("");
         if config.key_pair.0.is_empty() {
             log::info!("Generated new keypair for id: {}", config.id);
@@ -1216,12 +1334,212 @@ impl Config {
         KEY_PAIR.lock().unwrap().clone().map(|k| k.1)
     }
 
+    /// Whether this process holds the device's secrets: its key pair, the
+    /// stored permanent password and the secret options (the 2FA secret,
+    /// [`SECRET_OPTIONS`]). True unless the client said otherwise with
+    /// [`Config::set_holds_secrets`].
+    pub fn holds_secrets() -> bool {
+        SECRETS_HOLDER.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Sets whether this process holds the device's secrets (L442). Once the
+    /// client is installed on Windows its service holds them, and the
+    /// person's processes (the window, the connection manager) do not. A
+    /// process that does not hold them never makes, loads or keeps one: its
+    /// key pair is empty, or the holder's public key alone once it learned
+    /// it ([`Config::set_holder_public_key`]), and it has no stored permanent
+    /// password and no secret option. Storing its config keeps the secrets
+    /// in its files as they are, so copies an older version wrote there stay
+    /// until [`Config::remove_secrets_from_files`] takes them out.
+    pub fn set_holds_secrets(holds: bool) {
+        SECRETS_HOLDER.store(holds, std::sync::atomic::Ordering::SeqCst);
+        // Loaded again: a holder's key or the public key alone
+        *KEY_PAIR.lock().unwrap() = None;
+        if !holds {
+            let mut config = CONFIG.write().unwrap();
+            config.key_pair = Default::default();
+            config.password.clear();
+            drop(config);
+            remove_secret_options(&mut CONFIG2.write().unwrap().options);
+        }
+    }
+
+    /// The holder's public key, for a process that does not hold the key.
+    pub fn set_holder_public_key(public_key: Vec<u8>) {
+        if Self::holds_secrets() || public_key.len() != sign::PUBLICKEYBYTES {
+            return;
+        }
+        *KEY_PAIR.lock().unwrap() = Some((Vec::new(), public_key));
+    }
+
+    /// The secrets in this process's config files: a key pair with a secret
+    /// key, a stored permanent password with its salt, secret options. None
+    /// when the files hold none.
+    pub fn secrets_in_files() -> Option<ProfileSecrets> {
+        let mut config = Config::load_::<Config>("");
+        let mut secrets = ProfileSecrets::default();
+        if !config.key_pair.0.is_empty() {
+            secrets.key_pair = Some(std::mem::take(&mut config.key_pair));
+        }
+        if !config.password.is_empty()
+            && Self::validate_or_decrypt_permanent_password_storage(&mut config).is_ok()
+            && !config.password.is_empty()
+        {
+            secrets.permanent_password = Some((config.password, config.salt));
+        }
+        let config2 = Config::load_::<Config2>("2");
+        for key in SECRET_OPTIONS {
+            if let Some(value) = config2.options.get(*key).filter(|value| !value.is_empty()) {
+                secrets.options.insert((*key).to_owned(), value.clone());
+            }
+        }
+        (!secrets.is_empty()).then_some(secrets)
+    }
+
+    /// Takes the secrets out of the config files of a process that does not
+    /// hold them and leaves the rest of the files as they are. False in the
+    /// holder, or when the files hold no secret.
+    pub fn remove_secrets_from_files() -> bool {
+        if Self::holds_secrets() {
+            return false;
+        }
+        let mut removed = false;
+        {
+            // Holding CONFIG keeps this process's own stores out meanwhile
+            let _config = CONFIG.write().unwrap();
+            let mut stored = Config::load_::<Config>("");
+            if stored.key_pair != KeyPair::default() || !stored.password.is_empty() {
+                stored.key_pair = Default::default();
+                stored.password.clear();
+                Config::store_(&stored, "");
+                removed = true;
+            }
+        }
+        {
+            let _config2 = CONFIG2.write().unwrap();
+            let mut stored = Config::load_::<Config2>("2");
+            let before = stored.options.len();
+            remove_secret_options(&mut stored.options);
+            if stored.options.len() != before {
+                Config::store_(&stored, "2");
+                removed = true;
+            }
+        }
+        removed
+    }
+
+    /// Takes a key pair handed over by a process that does not hold the
+    /// device's secrets: the copy an older version left in the person's
+    /// profile (L442). Only when this process holds the secrets and has no
+    /// key yet, and only an Ed25519 pair whose halves belong together. The
+    /// key is registered again, so the server compares it with the one it
+    /// holds.
+    pub fn adopt_key_pair_if_none(key_pair: KeyPair) -> bool {
+        if !Self::holds_secrets() || !is_ed25519_key_pair(&key_pair) {
+            return false;
+        }
+        // Loaded first: loading may decrypt, which takes KEY_PAIR
+        drop(CONFIG.read().unwrap());
+        {
+            let mut lock = KEY_PAIR.lock().unwrap();
+            if lock.is_some() || !Config::load_::<Config>("").key_pair.0.is_empty() {
+                return false;
+            }
+            *lock = Some(key_pair.clone());
+        }
+        let mut config = CONFIG.write().unwrap();
+        config.key_pair = key_pair;
+        config.key_confirmed = false;
+        config.keys_confirmed = Default::default();
+        config.store();
+        true
+    }
+
+    /// Takes a stored permanent password and its salt handed over like
+    /// [`Config::adopt_key_pair_if_none`]: only when this process holds the
+    /// secrets, has no permanent password of its own and no preset one, and
+    /// may change it.
+    pub fn adopt_permanent_password_if_none(storage: &str, salt: &str) -> bool {
+        if !Self::holds_secrets()
+            || storage.is_empty()
+            || Self::is_disable_change_permanent_password()
+            || Self::has_usable_preset_password()
+        {
+            return false;
+        }
+        let mut config = CONFIG.write().unwrap();
+        if !config.password.is_empty() {
+            return false;
+        }
+        match Self::apply_permanent_password_storage_for_sync(&mut config, storage, salt) {
+            Ok(true) => {
+                config.store();
+                drop(config);
+                Self::clear_trusted_devices();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Takes a secret option handed over like
+    /// [`Config::adopt_key_pair_if_none`]: only when this process holds the
+    /// secrets and has no value for it.
+    pub fn adopt_secret_option_if_none(key: &str, value: &str) -> bool {
+        if !Self::holds_secrets()
+            || !SECRET_OPTIONS.contains(&key)
+            || value.is_empty()
+            || !Self::get_option(key).is_empty()
+        {
+            return false;
+        }
+        Self::set_option(key.to_owned(), value.to_owned());
+        true
+    }
+
+    /// This process's config for another process of the client, without the
+    /// key pair and the stored permanent password: they never leave the
+    /// process that holds them over IPC (L442).
+    pub fn get_for_other_process() -> Config {
+        let mut config = Self::get();
+        config.key_pair = Default::default();
+        config.password.clear();
+        config
+    }
+
+    /// Takes a config another process of the client sent and keeps this
+    /// process's key pair, stored permanent password and salt, whatever the
+    /// config sent carries (L442).
+    pub fn set_from_other_process(mut cfg: Config) -> bool {
+        let own = CONFIG.read().unwrap();
+        cfg.key_pair = own.key_pair.clone();
+        cfg.password = own.password.clone();
+        cfg.salt = own.salt.clone();
+        drop(own);
+        Self::set(cfg)
+    }
+
+    /// Takes the config the person's server process sends the root service
+    /// on Linux and macOS. It keeps the root service's key pair; only while
+    /// the root service has none does the key pair sent become its key, on a
+    /// first start.
+    pub fn set_from_user_server(mut cfg: Config) -> bool {
+        let adopt = Self::holds_secrets() && Self::get_existing_key_pair().is_none();
+        if !adopt {
+            cfg.key_pair = CONFIG.read().unwrap().key_pair.clone();
+        }
+        Self::set(cfg)
+    }
+
     /// Get existing key pair without generating a new one.
     /// Returns None if no key pair exists in cache or config file.
     pub fn get_existing_key_pair() -> Option<KeyPair> {
         let mut lock = KEY_PAIR.lock().unwrap();
         if let Some(p) = lock.as_ref() {
             return Some(p.clone());
+        }
+        if !Self::holds_secrets() {
+            return None;
         }
 
         // IMPORTANT: this path is called while holding KEY_PAIR lock.
@@ -1305,8 +1623,26 @@ impl Config {
         v.retain(|k, v| is_option_can_save(&OVERWRITE_SETTINGS, k, &DEFAULT_SETTINGS, v));
     }
 
+    /// The options for another process of the client, without the secret
+    /// options (L442).
+    pub fn get_options_for_other_process() -> HashMap<String, String> {
+        let mut options = Self::get_options();
+        remove_secret_options(&mut options);
+        options
+    }
+
+    /// Takes the options another process of the client sent and keeps this
+    /// process's secret options, whatever the options sent carry (L442).
+    pub fn set_options_from_other_process(mut v: HashMap<String, String>) {
+        keep_secret_options(&mut v, &CONFIG2.read().unwrap().options);
+        Self::set_options(v);
+    }
+
     pub fn set_options(mut v: HashMap<String, String>) {
         Self::purify_options(&mut v);
+        if !Self::holds_secrets() {
+            remove_secret_options(&mut v);
+        }
         let mut config = CONFIG2.write().unwrap();
         if config.options == v {
             return;
@@ -1330,6 +1666,10 @@ impl Config {
     }
 
     pub fn set_option(k: String, v: String) {
+        if !Self::holds_secrets() && SECRET_OPTIONS.contains(&k.as_str()) {
+            // The process that holds the device's secrets sets it (L442)
+            return;
+        }
         if !is_option_can_save(&OVERWRITE_SETTINGS, &k, &DEFAULT_SETTINGS, &v) {
             let mut config = CONFIG2.write().unwrap();
             if config.options.remove(&k).is_some() {
@@ -1364,7 +1704,9 @@ impl Config {
     /// preset password. Returns `false` when changing the password is disabled or
     /// the new password cannot be prepared for storage.
     pub fn set_permanent_password(password: &str) -> bool {
-        if Self::is_disable_change_permanent_password() {
+        if Self::is_disable_change_permanent_password() || !Self::holds_secrets() {
+            // A process that does not hold the device's secrets asks the
+            // holder to change it (L442)
             return false;
         }
         let (preset_storage, preset_salt) = Self::get_preset_password_storage_and_salt();
@@ -1421,6 +1763,9 @@ impl Config {
         storage: &str,
         salt: &str,
     ) -> crate::ResultType<bool> {
+        if !Self::holds_secrets() {
+            return Ok(false);
+        }
         let mut config = CONFIG.write().unwrap();
         if !Self::apply_permanent_password_storage_for_sync(&mut config, storage, salt)? {
             return Ok(false);
@@ -1729,7 +2074,11 @@ impl Config {
 
     // TODO: `Config::set()` does not invalidate trusted devices when permanent password/salt changes.
     // This matches historical behavior, but may need revisiting in a separate PR.
-    pub fn set(cfg: Config) -> bool {
+    pub fn set(mut cfg: Config) -> bool {
+        if !Self::holds_secrets() {
+            cfg.key_pair = Default::default();
+            cfg.password.clear();
+        }
         let mut lock = CONFIG.write().unwrap();
         if *lock == cfg {
             return false;
@@ -3024,6 +3373,8 @@ pub fn allow_insecure_tls_fallback() -> bool {
 }
 
 pub mod keys {
+    /// The 2FA secret (TOTP), see [`super::SECRET_OPTIONS`].
+    pub const OPTION_2FA: &str = "2fa";
     pub const OPTION_VIEW_ONLY: &str = "view_only";
     pub const OPTION_SHOW_MONITORS_TOOLBAR: &str = "show_monitors_toolbar";
     pub const OPTION_COLLAPSE_TOOLBAR: &str = "collapse_toolbar";
@@ -4029,6 +4380,366 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(!Config::get_key_confirmed());
+    }
+
+    /// Makes this test process the holder of the device's secrets again
+    /// after a test (L442).
+    struct SecretsHolderGuard;
+
+    impl Drop for SecretsHolderGuard {
+        fn drop(&mut self) {
+            Config::set_holds_secrets(true);
+        }
+    }
+
+    /// Puts CONFIG2 back as it was after a test.
+    struct Config2StateGuard(Config2);
+
+    impl Config2StateGuard {
+        fn new(config: Config2) -> Self {
+            Self(std::mem::replace(&mut *CONFIG2.write().unwrap(), config))
+        }
+    }
+
+    impl Drop for Config2StateGuard {
+        fn drop(&mut self) {
+            *CONFIG2.write().unwrap() = std::mem::take(&mut self.0);
+        }
+    }
+
+    /// A key pair made for the test; nothing prints it.
+    fn test_key_pair() -> KeyPair {
+        let (pk, sk) = sign::gen_keypair();
+        (sk.0.to_vec(), pk.0.to_vec())
+    }
+
+    fn stored_key_pair() -> KeyPair {
+        Config::load_::<Config>("").key_pair
+    }
+
+    /// A stored permanent password and its salt as the holder makes them.
+    fn test_permanent_password(password: &str) -> (String, String) {
+        let previous = Config::get();
+        assert!(Config::set_permanent_password(password));
+        let storage_and_salt = Config::get_local_permanent_password_storage_and_salt();
+        *CONFIG.write().unwrap() = previous;
+        storage_and_salt
+    }
+
+    /// Files as an older version left them in the person's profile: the key
+    /// pair, a stored permanent password and a 2FA secret, next to settings
+    /// that are no secret.
+    fn write_profile_with_secrets(
+        key_pair: &KeyPair,
+        (storage, salt): &(String, String),
+        two_fa: &str,
+    ) {
+        let mut config = Config::default();
+        config.key_pair = key_pair.clone();
+        config.password = storage.clone();
+        config.salt = salt.clone();
+        config.id = "123456789".to_owned();
+        Config::store_(&config, "");
+        let mut config2 = Config2::default();
+        config2
+            .options
+            .insert(keys::OPTION_2FA.to_owned(), two_fa.to_owned());
+        config2
+            .options
+            .insert("custom-rendezvous-server".to_owned(), "example.org".to_owned());
+        Config::store_(&config2, "2");
+    }
+
+    // A process of the person's (the window of an installed client) does
+    // not hold the device's secrets: it never keeps, loads or makes a secret
+    // key, a stored permanent password or a 2FA secret, and the copies an
+    // older version left in its files stay there as they are until the
+    // service holds the secrets (L442).
+    #[test]
+    fn test_a_process_that_does_not_hold_the_secrets_never_keeps_them() {
+        let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap();
+        let _file_guard = ConfigFileRestoreGuard::new(Config::file());
+        let _file2_guard = ConfigFileRestoreGuard::new(Config2::file());
+        let _key_guard = KeyPairCacheGuard::new();
+        let _holder_guard = SecretsHolderGuard;
+        let _state_guard = ConfigStateTestGuard::new(Config::default(), HashMap::new());
+        let _state2_guard = Config2StateGuard::new(Config2::default());
+        let legacy = test_key_pair();
+        let password = test_permanent_password("legacy-password");
+        write_profile_with_secrets(&legacy, &password, "legacy-2fa");
+        *CONFIG.write().unwrap() = Config::load();
+        *CONFIG2.write().unwrap() = Config2::load();
+        let raw = Config::load_::<Config>("");
+        let raw2 = Config::load_::<Config2>("2").options;
+
+        Config::set_holds_secrets(false);
+
+        assert!(
+            Config::get().key_pair.0.is_empty(),
+            "the secret key stayed in memory"
+        );
+        assert!(
+            Config::get_key_pair().0.is_empty(),
+            "get_key_pair gave a secret key"
+        );
+        assert!(Config::get_existing_key_pair().map_or(true, |k| k.0.is_empty()));
+        assert!(
+            Config::get_local_permanent_password_storage_and_salt().0.is_empty(),
+            "the stored permanent password stayed in memory"
+        );
+        assert!(
+            Config::get_option(keys::OPTION_2FA).is_empty(),
+            "the 2FA secret stayed in memory"
+        );
+        assert_eq!(Config::get_option("custom-rendezvous-server"), "example.org");
+
+        let mut synced = Config::get();
+        synced.key_pair = test_key_pair();
+        synced.password = password.0.clone();
+        // A change that is no secret, so the config is stored
+        synced.key_confirmed = !synced.key_confirmed;
+        assert!(Config::set(synced));
+        let mut synced2 = Config2::get();
+        synced2
+            .options
+            .insert(keys::OPTION_2FA.to_owned(), "synced-2fa".to_owned());
+        Config2::set(synced2);
+        Config::set_option(keys::OPTION_2FA.to_owned(), "set-2fa".to_owned());
+        let mut options = Config::get_options();
+        options.insert(keys::OPTION_2FA.to_owned(), "options-2fa".to_owned());
+        Config::set_options(options);
+        assert!(!Config::set_permanent_password("new-password"));
+        assert!(
+            Config::get().key_pair.0.is_empty(),
+            "a secret key from another process was kept"
+        );
+        assert!(Config::get_local_permanent_password_storage_and_salt()
+            .0
+            .is_empty());
+        assert!(Config::get_option(keys::OPTION_2FA).is_empty());
+
+        // A process started as one that does not hold them loads none either
+        *CONFIG.write().unwrap() = Config::load();
+        *CONFIG2.write().unwrap() = Config2::load();
+        assert!(Config::get().key_pair.0.is_empty());
+        assert!(
+            Config::get_local_permanent_password_storage_and_salt()
+                .0
+                .is_empty(),
+            "loading kept the stored permanent password"
+        );
+        assert!(
+            Config::get_option(keys::OPTION_2FA).is_empty(),
+            "loading kept the 2FA secret"
+        );
+
+        // Neither storing nor a key made in the background changed the files
+        std::thread::sleep(Duration::from_millis(200));
+        let after = Config::load_::<Config>("");
+        assert!(after.key_pair == legacy, "the key pair in the file changed");
+        assert!(after.password == raw.password, "the stored password in the file changed");
+        assert_eq!(after.salt, raw.salt);
+        assert_eq!(
+            Config::load_::<Config2>("2").options.get(keys::OPTION_2FA),
+            raw2.get(keys::OPTION_2FA),
+            "the 2FA secret in the file changed"
+        );
+    }
+
+    #[test]
+    fn test_the_secrets_leave_the_files_of_a_process_that_does_not_hold_them() {
+        let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap();
+        let _file_guard = ConfigFileRestoreGuard::new(Config::file());
+        let _file2_guard = ConfigFileRestoreGuard::new(Config2::file());
+        let _key_guard = KeyPairCacheGuard::new();
+        let _holder_guard = SecretsHolderGuard;
+        let _state_guard = ConfigStateTestGuard::new(Config::default(), HashMap::new());
+        let _state2_guard = Config2StateGuard::new(Config2::default());
+        let legacy = test_key_pair();
+        let password = test_permanent_password("legacy-password");
+        write_profile_with_secrets(&legacy, &password, "legacy-2fa");
+        let before = Config::load_::<Config>("");
+
+        // The holder never takes its own secrets out of its files
+        assert!(!Config::remove_secrets_from_files());
+        let found = Config::secrets_in_files().expect("the files hold secrets");
+        assert!(found.key_pair == Some(legacy.clone()));
+
+        Config::set_holds_secrets(false);
+        let found = Config::secrets_in_files().expect("the files hold secrets");
+        assert!(found.key_pair == Some(legacy));
+        assert!(
+            found.permanent_password == Some(password.clone()),
+            "the stored permanent password was not found as the holder stores it"
+        );
+        assert_eq!(
+            found.options.get(keys::OPTION_2FA).map(String::as_str),
+            Some("legacy-2fa")
+        );
+        assert!(Config::remove_secrets_from_files());
+        assert!(Config::secrets_in_files().is_none());
+        let after = Config::load_::<Config>("");
+        assert!(after.key_pair == KeyPair::default(), "the public key stayed");
+        assert!(after.password.is_empty(), "the stored password stayed");
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.enc_id, before.enc_id);
+        assert_eq!(after.salt, password.1);
+        let after2 = Config::load_::<Config2>("2");
+        assert!(!after2.options.contains_key(keys::OPTION_2FA));
+        assert_eq!(
+            after2.options.get("custom-rendezvous-server").map(String::as_str),
+            Some("example.org")
+        );
+        assert!(!Config::remove_secrets_from_files());
+    }
+
+    #[test]
+    fn test_the_holder_takes_handed_over_secrets_only_when_it_has_none() {
+        let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap();
+        let _file_guard = ConfigFileRestoreGuard::new(Config::file());
+        let _file2_guard = ConfigFileRestoreGuard::new(Config2::file());
+        let _key_guard = KeyPairCacheGuard::new();
+        let _holder_guard = SecretsHolderGuard;
+        let mut confirmed = Config::default();
+        confirmed.key_confirmed = true;
+        Config::store_(&confirmed, "");
+        Config::store_(&Config2::default(), "2");
+        let _state_guard = ConfigStateTestGuard::new(confirmed, HashMap::new());
+        let _state2_guard = Config2StateGuard::new(Config2::default());
+
+        let mut mismatched = test_key_pair();
+        mismatched.1 = test_key_pair().1;
+        assert!(!Config::adopt_key_pair_if_none(mismatched));
+        assert!(!Config::adopt_key_pair_if_none((vec![1u8; 64], vec![2u8; 32])));
+        assert!(stored_key_pair().0.is_empty());
+
+        let handed = test_key_pair();
+        assert!(Config::adopt_key_pair_if_none(handed.clone()));
+        assert!(Config::get_key_pair() == handed);
+        assert!(stored_key_pair() == handed);
+        // Registered once, so the server compares it with the key it holds
+        assert!(!Config::get_key_confirmed());
+
+        assert!(!Config::adopt_key_pair_if_none(test_key_pair()));
+        assert!(Config::get_key_pair() == handed);
+        assert!(stored_key_pair() == handed);
+
+        let first = test_permanent_password("first-password");
+        let second = test_permanent_password("second-password");
+        assert!(!Config::adopt_permanent_password_if_none("not-a-storage", &first.1));
+        assert!(!Config::has_local_permanent_password());
+        assert!(Config::adopt_permanent_password_if_none(&first.0, &first.1));
+        assert!(Config::get_local_permanent_password_storage_and_salt() == first);
+        assert!(!Config::adopt_permanent_password_if_none(&second.0, &second.1));
+        assert!(
+            Config::get_local_permanent_password_storage_and_salt() == first,
+            "a handed-over password replaced the holder's own"
+        );
+
+        assert!(!Config::adopt_secret_option_if_none("custom-rendezvous-server", "x"));
+        assert!(Config::adopt_secret_option_if_none(keys::OPTION_2FA, "first-2fa"));
+        assert!(!Config::adopt_secret_option_if_none(keys::OPTION_2FA, "second-2fa"));
+        assert_eq!(Config::get_option(keys::OPTION_2FA), "first-2fa");
+
+        // A process that does not hold the secrets takes none
+        Config::store_(&Config::default(), "");
+        Config::store_(&Config2::default(), "2");
+        *KEY_PAIR.lock().unwrap() = None;
+        *CONFIG.write().unwrap() = Config::default();
+        *CONFIG2.write().unwrap() = Config2::default();
+        Config::set_holds_secrets(false);
+        assert!(!Config::adopt_key_pair_if_none(test_key_pair()));
+        assert!(!Config::adopt_permanent_password_if_none(&first.0, &first.1));
+        assert!(!Config::adopt_secret_option_if_none(keys::OPTION_2FA, "first-2fa"));
+        assert!(Config::secrets_in_files().is_none());
+    }
+
+    #[test]
+    fn test_a_config_for_or_from_another_process_does_not_move_the_secrets() {
+        let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap();
+        let _file_guard = ConfigFileRestoreGuard::new(Config::file());
+        let _file2_guard = ConfigFileRestoreGuard::new(Config2::file());
+        let _key_guard = KeyPairCacheGuard::new();
+        let _holder_guard = SecretsHolderGuard;
+        let _state_guard = ConfigStateTestGuard::new(Config::default(), HashMap::new());
+        let _state2_guard = Config2StateGuard::new(Config2::default());
+        let own = test_key_pair();
+        let own_password = test_permanent_password("own-password");
+        write_profile_with_secrets(&own, &own_password, "own-2fa");
+        *CONFIG.write().unwrap() = Config::load();
+        *CONFIG2.write().unwrap() = Config2::load();
+
+        let for_other = Config::get_for_other_process();
+        assert!(
+            for_other.key_pair == KeyPair::default(),
+            "the config for another process carries the key pair"
+        );
+        assert!(
+            for_other.password.is_empty(),
+            "the config for another process carries the stored password"
+        );
+        assert!(!Config2::get_for_other_process()
+            .options
+            .contains_key(keys::OPTION_2FA));
+        assert!(!Config::get_options_for_other_process().contains_key(keys::OPTION_2FA));
+        assert_eq!(
+            Config::get_options_for_other_process()
+                .get("custom-rendezvous-server")
+                .map(String::as_str),
+            Some("example.org")
+        );
+
+        let planted_password = test_permanent_password("planted-password");
+        let mut planted = Config::get();
+        planted.key_pair = test_key_pair();
+        planted.password = planted_password.0.clone();
+        planted.salt = planted_password.1.clone();
+        planted.key_confirmed = true;
+        Config::set_from_other_process(planted);
+        assert!(stored_key_pair() == own, "a key pair sent over IPC replaced the own");
+        assert!(
+            Config::get_local_permanent_password_storage_and_salt() == own_password,
+            "a password sent over IPC replaced the own"
+        );
+        assert!(Config::get_key_confirmed(), "the rest of the config was not taken");
+
+        let mut planted2 = Config2::get_for_other_process();
+        planted2
+            .options
+            .insert("custom-rendezvous-server".to_owned(), "other.example.org".to_owned());
+        Config2::set_from_other_process(planted2.clone());
+        assert_eq!(Config::get_option(keys::OPTION_2FA), "own-2fa");
+        assert_eq!(
+            Config::get_option("custom-rendezvous-server"),
+            "other.example.org"
+        );
+        planted2
+            .options
+            .insert(keys::OPTION_2FA.to_owned(), "planted-2fa".to_owned());
+        Config2::set_from_other_process(planted2);
+        assert_eq!(Config::get_option(keys::OPTION_2FA), "own-2fa");
+        Config::set_options_from_other_process(Config::get_options_for_other_process());
+        assert_eq!(
+            Config::get_option(keys::OPTION_2FA),
+            "own-2fa",
+            "options from another process removed the 2FA secret"
+        );
+
+        // The root service on Linux and macOS keeps its key, and without a
+        // key yet takes the one the person's server process sends on a
+        // first start
+        let mut sent = Config::get();
+        sent.key_pair = test_key_pair();
+        Config::set_from_user_server(sent);
+        assert!(stored_key_pair() == own);
+        Config::store_(&Config::default(), "");
+        *KEY_PAIR.lock().unwrap() = None;
+        *CONFIG.write().unwrap() = Config::default();
+        let first = test_key_pair();
+        let mut sent = Config::default();
+        sent.key_pair = first.clone();
+        Config::set_from_user_server(sent);
+        assert!(stored_key_pair() == first);
     }
 
     #[test]
