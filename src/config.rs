@@ -20,6 +20,8 @@ use sodiumoxide::base64;
 use sodiumoxide::crypto::sign;
 
 mod permanent_password;
+#[cfg(any(windows, test))]
+mod service_dir;
 
 pub use permanent_password::{
     compute_permanent_password_h1, decode_permanent_password_h1_from_storage,
@@ -964,10 +966,19 @@ impl Config {
             let org = "".to_owned();
             #[cfg(target_os = "macos")]
             let org = ORG.read().unwrap().clone();
+            let app_name = APP_NAME.read().unwrap().clone();
             // /var/root for root
-            if let Some(project) =
-                directories_next::ProjectDirs::from("", &org, &APP_NAME.read().unwrap())
-            {
+            if let Some(project) = directories_next::ProjectDirs::from("", &org, &app_name) {
+                // The Windows service keeps its config in a folder of its own (L442)
+                #[cfg(windows)]
+                if service_dir::is_system_profile(project.config_dir()) {
+                    let mut path = service_dir::config_dir(
+                        &app_name,
+                        patch(project.config_dir().to_path_buf()),
+                    );
+                    path.push(p);
+                    return path;
+                }
                 let mut path = patch(project.config_dir().to_path_buf());
                 path.push(p);
                 return path;
