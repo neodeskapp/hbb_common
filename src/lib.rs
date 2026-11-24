@@ -495,6 +495,9 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
                     .ok();
             }
         }
+        // The service's first start moves its config before the logger runs
+        #[cfg(windows)]
+        config::Config::flush_service_dir_notes();
     });
     logger_holder
 }

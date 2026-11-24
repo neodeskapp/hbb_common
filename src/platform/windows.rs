@@ -196,3 +196,24 @@ pub fn is_windows_version_or_greater(
 
     result == TRUE
 }
+
+/// Writes `message` to the Windows Application event log as a warning or an
+/// error with `id` (1 to 1000) under the event source `source`, through
+/// eventcreate.exe, which registers the source on first use. Needs
+/// administrator rights, which the service has. False when it could not.
+pub fn write_application_event(source: &str, warning: bool, id: u32, message: &str) -> bool {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let system_root = std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+    let id = id.clamp(1, 1000).to_string();
+    std::process::Command::new(system_root.join("System32").join("eventcreate.exe"))
+        .args(["/L", "APPLICATION", "/T"])
+        .arg(if warning { "WARNING" } else { "ERROR" })
+        .args(["/SO", source, "/ID", &id, "/D", message])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_or(false, |output| output.status.success())
+}

@@ -1345,6 +1345,13 @@ impl Config {
         KEY_PAIR.lock().unwrap().clone().map(|k| k.1)
     }
 
+    /// Writes the log lines of the Windows service's config move that came
+    /// before the logger ran (L487).
+    #[cfg(windows)]
+    pub fn flush_service_dir_notes() {
+        service_dir::flush_notes();
+    }
+
     /// Whether this process holds the device's secrets: its key pair, the
     /// stored permanent password and the secret options (the 2FA secret,
     /// [`SECRET_OPTIONS`]). True unless the client said otherwise with

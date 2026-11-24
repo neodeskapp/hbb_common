@@ -16,6 +16,9 @@ use crate::log;
 const CONFIG: &str = "config";
 /// Where a move copies the config to before it renames it to [`CONFIG`].
 const MOVING: &str = "config.moving";
+/// The file in the service's folder that one move at a time holds open.
+#[cfg(windows)]
+const MOVE_LOCK: &str = "move.lock";
 
 /// Log lines of the move, kept until the logger runs: the first process of
 /// the service moves its config while its logger asks for its log folder.
@@ -32,8 +35,8 @@ fn note(level: log::Level, message: String) {
     }
 }
 
-/// Writes the kept log lines once the logger runs.
-fn flush_notes() {
+/// Writes the kept log lines once the logger runs (L487).
+pub(super) fn flush_notes() {
     if log::max_level() == log::LevelFilter::Off {
         return;
     }
@@ -96,8 +99,12 @@ fn program_data() -> PathBuf {
 #[cfg(windows)]
 fn prepare(root: &Path, old_dir: &Path) -> io::Result<PathBuf> {
     secure::make_root(root)?;
-    let _lock = lock(root)?;
-    move_config(old_dir, root)
+    let lock = lock(root)?;
+    let moved = move_config(old_dir, root);
+    drop(lock);
+    // A process still waiting for the lock makes the file again
+    fs::remove_file(root.join(MOVE_LOCK)).ok();
+    moved
 }
 
 /// Holds `root\move.lock` open without sharing, so one process of the
@@ -106,7 +113,7 @@ fn prepare(root: &Path, old_dir: &Path) -> io::Result<PathBuf> {
 fn lock(root: &Path) -> io::Result<fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
     const ERROR_SHARING_VIOLATION: i32 = 32;
-    let path = root.join("move.lock");
+    let path = root.join(MOVE_LOCK);
     for _ in 0..300 {
         match fs::OpenOptions::new()
             .write(true)
@@ -257,15 +264,26 @@ mod secure {
                         return Ok(());
                     }
                     let aside = aside_path(root);
-                    note(
-                        log::Level::Warn,
-                        format!(
-                            "{} is open to other accounts than SYSTEM and Administrators; it moves to {} and the service starts a folder of its own",
-                            root.display(),
-                            aside.display()
-                        ),
+                    let message = format!(
+                        "{} is open to other accounts than SYSTEM and Administrators; it moves to {} and the service starts a folder of its own",
+                        root.display(),
+                        aside.display()
                     );
+                    note(log::Level::Warn, message.clone());
                     fs::rename(root, &aside)?;
+                    // An administrator sees it in the Application log too
+                    let source = root
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    if !crate::platform::windows::write_application_event(
+                        &source, true, 1, &message,
+                    ) {
+                        note(
+                            log::Level::Error,
+                            "Could not write the move aside to the Application log".to_owned(),
+                        );
+                    }
                 }
             }
         }
